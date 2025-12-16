@@ -1,0 +1,291 @@
+Option Explicit
+
+Private Const SRC_SHEET_NAME As String = "Additional entity-specific"
+
+Public Sub Build_TestedPartyData_FromIR()
+    Dim wbIR As Workbook, ws As Worksheet
+    Set wbIR = ActiveWorkbook ' or set explicitly if you open the IR file
+    Set ws = wbIR.Worksheets(SRC_SHEET_NAME)
+
+    Dim entityName As String
+    entityName = GetEntityName(ws)
+
+    Dim fyCells As Collection
+    Set fyCells = FindFirstTwoFiscalPeriodCells(ws)
+
+    If fyCells.Count = 0 Then Err.Raise vbObjectError + 1, , "No 'Fiscal periods (FY ####)' header found."
+    If fyCells.Count = 1 Then Err.Raise vbObjectError + 2, , "Only one FY block found (need current + prior)."
+
+    Dim wbOut As Workbook
+    Set wbOut = Workbooks.Add(xlWBATWorksheet)
+
+    ' clean default sheets
+    Dim i As Long
+    Application.DisplayAlerts = False
+    For i = wbOut.Worksheets.Count To 2 Step -1
+        wbOut.Worksheets(i).Delete
+    Next i
+    Application.DisplayAlerts = True
+
+    ' build two sheets
+    BuildOneFYSheet wbOut.Worksheets(1), ws, fyCells(1), entityName
+    BuildOneFYSheet wbOut.Worksheets.Add(After:=wbOut.Worksheets(1)), ws, fyCells(2), entityName
+
+    wbOut.Worksheets(2).Move After:=wbOut.Worksheets(1) ' keep order
+End Sub
+
+Private Sub BuildOneFYSheet(ByVal wsOut As Worksheet, ByVal wsSrc As Worksheet, ByVal fyCell As Range, ByVal entityName As String)
+    Dim fyYear As Long
+    fyYear = ExtractFYYear(CStr(fyCell.Value2))
+
+    wsOut.Name = "Tested Party Data (FY" & Right$(CStr(fyYear), 2) & ")"
+
+    ' detect value columns on the FY header row
+    Dim colLabel As Long: colLabel = fyCell.Column
+    Dim colLocal As Long, colUS As Long
+    colLocal = FindHeaderColOnRow(wsSrc, fyCell.Row, "local")
+    colUS = FindHeaderColOnRow(wsSrc, fyCell.Row, "us")
+
+    Dim includeLocal As Boolean, includeUS As Boolean
+    includeLocal = ColumnHasAnyDataForPnL(wsSrc, fyCell.Row, colLabel, colLocal)
+    includeUS = ColumnHasAnyDataForPnL(wsSrc, fyCell.Row, colLabel, colUS)
+
+    If Not includeLocal And Not includeUS Then
+        ' fallback: if headers exist but blank test failed, still include US if it exists
+        includeUS = (colUS > 0)
+    End If
+
+    ' === Output layout ===
+    ' Row 1: green entity header (missing in your current output)
+    With wsOut.Range("A1")
+        .Value = entityName
+        .Font.Bold = True
+    End With
+
+    Dim lastCol As Long: lastCol = 1
+    If includeLocal Then lastCol = lastCol + 1
+    If includeUS Then lastCol = lastCol + 1
+
+    With wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(1, lastCol))
+        .Merge
+        .Interior.Color = RGB(0, 176, 80) ' green
+        .Font.Color = vbWhite
+        .HorizontalAlignment = xlCenter
+    End With
+
+    ' Row 2: FY header + column headers (yellow)
+    wsOut.Cells(2, 1).Value = CStr(fyCell.Value2)
+    wsOut.Cells(2, 1).Font.Bold = True
+    wsOut.Cells(2, 1).Interior.Color = RGB(255, 255, 0) ' yellow
+
+    Dim outCol As Long: outCol = 2
+    If includeLocal Then
+        wsOut.Cells(2, outCol).Value = "Local GAAP"
+        wsOut.Cells(2, outCol).Font.Bold = True
+        outCol = outCol + 1
+    End If
+    If includeUS Then
+        wsOut.Cells(2, outCol).Value = "US GAAP"
+        wsOut.Cells(2, outCol).Font.Bold = True
+    End If
+    wsOut.Range(wsOut.Cells(2, 1), wsOut.Cells(2, lastCol)).Interior.Color = RGB(255, 255, 0)
+
+    ' Line items we want (label matching)
+    Dim items As Variant
+    items = Array( _
+        "Revenue", _
+        "Cost of sales", _
+        "Gross profit", _
+        "Other operating expenses/income", _
+        "Operating profit/(loss)" _
+    )
+
+    Dim rOut As Long: rOut = 3
+    Dim idx As Long
+    For idx = LBound(items) To UBound(items)
+        Dim srcRow As Long
+        srcRow = FindLineItemRow(wsSrc, fyCell.Row + 1, items(idx))
+        wsOut.Cells(rOut, 1).Value = items(idx)
+
+        outCol = 2
+        If includeLocal Then
+            wsOut.Cells(rOut, outCol).Value = IIf(srcRow > 0 And colLocal > 0, wsSrc.Cells(srcRow, colLocal).Value2, vbNullString)
+            outCol = outCol + 1
+        End If
+        If includeUS Then
+            wsOut.Cells(rOut, outCol).Value = IIf(srcRow > 0 And colUS > 0, wsSrc.Cells(srcRow, colUS).Value2, vbNullString)
+        End If
+
+        rOut = rOut + 1
+    Next idx
+
+    ' Find output rows for formulas
+    Dim rowRevenue As Long: rowRevenue = FindTextRow(wsOut, 3, "Revenue")
+    Dim rowCOS As Long: rowCOS = FindTextRow(wsOut, 3, "Cost of sales")
+    Dim rowOpex As Long: rowOpex = FindTextRow(wsOut, 3, "Other operating expenses/income")
+    Dim rowOP As Long: rowOP = FindTextRow(wsOut, 3, "Operating profit/(loss)")
+
+    ' Append NCP then OM
+    wsOut.Cells(rOut, 1).Value = "Net Cost Plus (NCP)"
+    wsOut.Cells(rOut + 1, 1).Value = "Operating Margin (OM)"
+    wsOut.Range(wsOut.Cells(rOut, 1), wsOut.Cells(rOut + 1, 1)).Font.Bold = True
+
+    ' Write formulas per included column(s)
+    Dim c As Long
+    For c = 2 To lastCol
+        ' NCP = OP / (COS + Opex)
+        If rowOP > 0 And rowCOS > 0 And rowOpex > 0 Then
+            wsOut.Cells(rOut, c).Formula = "=" & wsOut.Cells(rowOP, c).Address(False, False) & "/(" & _
+                                                wsOut.Cells(rowCOS, c).Address(False, False) & "+" & _
+                                                wsOut.Cells(rowOpex, c).Address(False, False) & ")"
+        End If
+
+        ' OM = OP / Revenue
+        If rowOP > 0 And rowRevenue > 0 Then
+            wsOut.Cells(rOut + 1, c).Formula = "=" & wsOut.Cells(rowOP, c).Address(False, False) & "/" & _
+                                                   wsOut.Cells(rowRevenue, c).Address(False, False)
+        End If
+
+        wsOut.Cells(rOut, c).NumberFormat = "0.00%"
+        wsOut.Cells(rOut + 1, c).NumberFormat = "0.00%"
+    Next c
+
+    ' Basic formatting
+    wsOut.Columns("A:" & ColLetter(lastCol)).AutoFit
+End Sub
+
+' ---------- Helpers ----------
+
+Private Function FindFirstTwoFiscalPeriodCells(ByVal ws As Worksheet) As Collection
+    Dim results As New Collection
+    Dim ur As Range: Set ur = ws.UsedRange
+
+    Dim r As Long, c As Long
+    For r = ur.Row To ur.Row + ur.Rows.Count - 1
+        ' stop at segmented P&Ls
+        If InStr(1, LCase$(CStr(ws.Cells(r, 1).Value2)), "distribution activity") > 0 Then Exit For
+        If InStr(1, LCase$(CStr(ws.Cells(r, 1).Value2)), "management services activity") > 0 Then Exit For
+
+        For c = ur.Column To ur.Column + ur.Columns.Count - 1
+            Dim v As String: v = Trim$(CStr(ws.Cells(r, c).Value2))
+            If LooksLikeFiscalPeriods(v) Then
+                results.Add ws.Cells(r, c)
+                If results.Count = 2 Then
+                    Set FindFirstTwoFiscalPeriodCells = results
+                    Exit Function
+                End If
+            End If
+        Next c
+    Next r
+
+    Set FindFirstTwoFiscalPeriodCells = results
+End Function
+
+Private Function LooksLikeFiscalPeriods(ByVal s As String) As Boolean
+    s = LCase$(s)
+    LooksLikeFiscalPeriods = (InStr(s, "fiscal") > 0 And InStr(s, "period") > 0 And InStr(s, "(fy") > 0 And InStr(s, ")") > 0)
+End Function
+
+Private Function ExtractFYYear(ByVal s As String) As Long
+    ' pull first 4-digit year found
+    Dim i As Long
+    For i = 1 To Len(s) - 3
+        Dim chunk As String
+        chunk = Mid$(s, i, 4)
+        If chunk Like "20##" Then
+            ExtractFYYear = CLng(chunk)
+            Exit Function
+        End If
+    Next i
+    ExtractFYYear = 0
+End Function
+
+Private Function FindHeaderColOnRow(ByVal ws As Worksheet, ByVal headerRow As Long, ByVal key As String) As Long
+    Dim lastC As Long: lastC = ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
+    Dim c As Long
+    For c = 1 To lastC
+        Dim v As String: v = LCase$(Trim$(CStr(ws.Cells(headerRow, c).Value2)))
+        If InStr(v, key) > 0 And InStr(v, "gaap") > 0 Then
+            FindHeaderColOnRow = c
+            Exit Function
+        End If
+        ' tolerate "gap" typo
+        If InStr(v, key) > 0 And InStr(v, "gap") > 0 Then
+            FindHeaderColOnRow = c
+            Exit Function
+        End If
+    Next c
+    FindHeaderColOnRow = 0
+End Function
+
+Private Function ColumnHasAnyDataForPnL(ByVal ws As Worksheet, ByVal headerRow As Long, ByVal colLabel As Long, ByVal colValue As Long) As Boolean
+    If colValue = 0 Then ColumnHasAnyDataForPnL = False: Exit Function
+
+    Dim labels As Variant
+    labels = Array("Revenue", "Cost of sales", "Gross profit", "Other operating expenses/income", "Operating profit/(loss)")
+
+    Dim i As Long
+    For i = LBound(labels) To UBound(labels)
+        Dim r As Long: r = FindLineItemRow(ws, headerRow + 1, CStr(labels(i)))
+        If r > 0 Then
+            If Len(Trim$(CStr(ws.Cells(r, colValue).Value2))) > 0 Then
+                ColumnHasAnyDataForPnL = True
+                Exit Function
+            End If
+        End If
+    Next i
+    ColumnHasAnyDataForPnL = False
+End Function
+
+Private Function FindLineItemRow(ByVal ws As Worksheet, ByVal startRow As Long, ByVal label As String) As Long
+    Dim maxLook As Long: maxLook = startRow + 25 ' enough for simplified P&L block
+    Dim r As Long
+    For r = startRow To maxLook
+        Dim v As String: v = LCase$(Trim$(CStr(ws.Cells(r, ws.Cells(startRow - 1, 1).Column).Value2)))
+        ' assume labels are in same column as FY cell (typically column A)
+        v = LCase$(Trim$(CStr(ws.Cells(r, 1).Value2)))
+
+        If NormalizeLabel(v) = NormalizeLabel(LCase$(label)) Then
+            FindLineItemRow = r
+            Exit Function
+        End If
+    Next r
+    FindLineItemRow = 0
+End Function
+
+Private Function NormalizeLabel(ByVal s As String) As String
+    s = LCase$(Trim$(s))
+    s = Replace(s, " ", "")
+    s = Replace(s, "/", "")
+    s = Replace(s, "(", "")
+    s = Replace(s, ")", "")
+    NormalizeLabel = s
+End Function
+
+Private Function GetEntityName(ByVal ws As Worksheet) As String
+    Dim c As Long
+    For c = 1 To ws.Columns.Count
+        Dim v As String: v = Trim$(CStr(ws.Cells(1, c).Value2))
+        If Len(v) > 0 Then
+            GetEntityName = v
+            Exit Function
+        End If
+    Next c
+    GetEntityName = "(Entity Name Not Found)"
+End Function
+
+Private Function FindTextRow(ByVal ws As Worksheet, ByVal startRow As Long, ByVal text As String) As Long
+    Dim lastR As Long: lastR = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    Dim r As Long
+    For r = startRow To lastR
+        If LCase$(Trim$(CStr(ws.Cells(r, 1).Value2))) = LCase$(text) Then
+            FindTextRow = r
+            Exit Function
+        End If
+    Next r
+    FindTextRow = 0
+End Function
+
+Private Function ColLetter(ByVal colNum As Long) As String
+    ColLetter = Split(Cells(1, colNum).Address(True, False), "$")(0)
+End Function
