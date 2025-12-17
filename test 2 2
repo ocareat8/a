@@ -1,0 +1,547 @@
+Option Explicit
+
+' =========================
+' DATA MODEL (MUST BE AT MODULE LEVEL)
+' =========================
+Private Type TxRow
+    Category As String
+    Direction As String ' "Purchases" / "Sales" / "Other"
+    Counterparty As String
+    Jurisdiction As String
+    Relationship As String
+    VolumeUSD As Double
+End Type
+
+' =========================
+' ENTRY POINT
+' =========================
+Public Sub Build_ICTransactions_FromIR()
+
+    Dim filePath As String
+    filePath = Application.GetOpenFilename( _
+        FileFilter:="Excel Files (*.xlsx;*.xlsm;*.xls), *.xlsx;*.xlsm;*.xls", _
+        Title:="Select the client Information Request Excel file" _
+    )
+    If filePath = "False" Or Len(filePath) = 0 Then Exit Sub
+
+    Dim wbIR As Workbook
+    Set wbIR = OpenWorkbookSafe(CStr(filePath))
+
+    Dim wsTx As Worksheet
+    Set wsTx = FindWorksheetByNameInsensitive(wbIR, "Transaction information")
+    If wsTx Is Nothing Then
+        Set wsTx = FindWorksheetByNameContainsInsensitive(wbIR, "transaction")
+    End If
+    If wsTx Is Nothing Then Err.Raise vbObjectError + 501, , "Could not find the Transaction Information tab."
+
+    Dim entityName As String
+    entityName = GetEntityNameRow1(wsTx)
+    If Len(entityName) = 0 Then entityName = "(Entity Name Not Found)"
+
+    Dim fySuffix As String
+    fySuffix = DetectFYSuffix(wsTx)
+    If Len(fySuffix) = 0 Then fySuffix = "25"
+
+    Dim headerRow As Long
+    headerRow = FindHeaderRow(wsTx, Array("transaction category"))
+    If headerRow = 0 Then Err.Raise vbObjectError + 502, , "Could not locate the transaction table header row (Transaction Category)."
+
+    Dim colCat As Long: colCat = FindHeaderCol(wsTx, headerRow, Array("transaction category", "covered transaction", "category"))
+    Dim colSeller As Long: colSeller = FindHeaderCol(wsTx, headerRow, Array("seller", "service provider", "lender", "licensor"))
+    Dim colSellerCtry As Long: colSellerCtry = FindHeaderCol(wsTx, headerRow, Array("country"))
+    Dim colPurch As Long: colPurch = FindHeaderCol(wsTx, headerRow, Array("purchaser", "service recipient", "borrower", "licensee"))
+    Dim colPurchCtry As Long: colPurchCtry = FindHeaderCol(wsTx, headerRow, Array("country"), colSellerCtry + 1)
+    Dim colVolUSD As Long: colVolUSD = FindHeaderCol(wsTx, headerRow, Array("usd"), 1)
+    Dim colVolLocal As Long: colVolLocal = FindHeaderCol(wsTx, headerRow, Array("local currency", "local"), 1)
+
+    If colCat = 0 Or colSeller = 0 Or colPurch = 0 Then
+        Err.Raise vbObjectError + 503, , "Missing required columns. Need at least Transaction Category + Seller + Purchaser columns."
+    End If
+    If colVolUSD = 0 And colVolLocal = 0 Then
+        Err.Raise vbObjectError + 504, , "Could not find a volume column (USD or Local Currency)."
+    End If
+    If colSellerCtry = 0 Then colSellerCtry = colSeller + 1
+    If colPurchCtry = 0 Then colPurchCtry = colPurch + 1
+
+    Dim lastRow As Long
+    lastRow = FindLastDataRow(wsTx, colCat, headerRow + 1)
+
+    Dim data As Collection
+    Set data = LoadTransactions(wsTx, headerRow + 1, lastRow, entityName, colCat, colSeller, colSellerCtry, colPurch, colPurchCtry, colVolUSD, colVolLocal)
+
+    Dim wbOut As Workbook
+    Set wbOut = Workbooks.Add(xlWBATWorksheet)
+
+    Application.DisplayAlerts = False
+    Do While wbOut.Worksheets.Count > 1
+        wbOut.Worksheets(wbOut.Worksheets.Count).Delete
+    Loop
+    Application.DisplayAlerts = True
+
+    Dim wsOut As Worksheet
+    Set wsOut = wbOut.Worksheets(1)
+    wsOut.Name = "IC Transactions"
+
+    With wsOut.Cells
+        .Font.Name = "Calibri"
+        .Font.Size = 10
+    End With
+
+    Dim outRow As Long: outRow = 1
+    outRow = WriteTopTitle(wsOut, outRow, entityName)
+    outRow = outRow + 1
+    outRow = PrintGroupedTransactions(wsOut, outRow, data, entityName)
+
+    wsOut.Columns("A:E").AutoFit
+
+    wsOut.Activate
+    ActiveWindow.DisplayGridlines = False
+
+    Dim safeEntity As String
+    safeEntity = CleanFileName(entityName)
+
+    Dim baseName As String
+    baseName = safeEntity & "_FY" & fySuffix & "_IC Transactions"
+
+    Dim outFolder As String
+    outFolder = wbIR.Path
+    If Len(outFolder) = 0 Then outFolder = Environ$("USERPROFILE") & "\Desktop"
+
+    Dim savePath As String
+    savePath = GetUniqueSavePath(outFolder, baseName, "xlsx")
+
+    Application.DisplayAlerts = False
+    wbOut.SaveAs Filename:=savePath, FileFormat:=xlOpenXMLWorkbook
+    Application.DisplayAlerts = True
+
+End Sub
+
+' =========================
+' LOAD + TRANSFORM
+' =========================
+Private Function LoadTransactions(ByVal ws As Worksheet, ByVal rStart As Long, ByVal rEnd As Long, _
+                                 ByVal entityName As String, _
+                                 ByVal colCat As Long, ByVal colSeller As Long, ByVal colSellerCtry As Long, _
+                                 ByVal colPurch As Long, ByVal colPurchCtry As Long, _
+                                 ByVal colVolUSD As Long, ByVal colVolLocal As Long) As Collection
+
+    Dim rows As New Collection
+    Dim r As Long
+
+    For r = rStart To rEnd
+        Dim cat As String: cat = Trim$(CStr(ws.Cells(r, colCat).Value2))
+        If Len(cat) = 0 Then GoTo NextR
+
+        Dim seller As String: seller = Trim$(CStr(ws.Cells(r, colSeller).Value2))
+        Dim purch As String: purch = Trim$(CStr(ws.Cells(r, colPurch).Value2))
+
+        Dim sellerC As String: sellerC = Trim$(CStr(ws.Cells(r, colSellerCtry).Value2))
+        Dim purchC As String: purchC = Trim$(CStr(ws.Cells(r, colPurchCtry).Value2))
+
+        Dim dir As String, counterparty As String, juris As String
+        dir = InferDirection(entityName, seller, purch)
+
+        If dir = "Sales" Then
+            counterparty = purch
+            juris = purchC
+        ElseIf dir = "Purchases" Then
+            counterparty = seller
+            juris = sellerC
+        Else
+            If Len(purch) > 0 And LCase$(purch) <> LCase$(entityName) Then
+                counterparty = purch: juris = purchC
+            Else
+                counterparty = seller: juris = sellerC
+            End If
+        End If
+
+        Dim vol As Double: vol = 0#
+        If colVolUSD > 0 Then
+            If Not IsError(ws.Cells(r, colVolUSD).Value2) And Len(Trim$(CStr(ws.Cells(r, colVolUSD).Value2))) > 0 Then
+                vol = CDblSafe(ws.Cells(r, colVolUSD).Value2)
+            End If
+        End If
+        If vol = 0# And colVolLocal > 0 Then
+            If Not IsError(ws.Cells(r, colVolLocal).Value2) And Len(Trim$(CStr(ws.Cells(r, colVolLocal).Value2))) > 0 Then
+                vol = CDblSafe(ws.Cells(r, colVolLocal).Value2)
+            End If
+        End If
+
+        Dim tx As TxRow
+        tx.Category = cat
+        tx.Direction = dir
+        tx.Counterparty = counterparty
+        tx.Jurisdiction = juris
+        tx.Relationship = "Affiliate"
+        tx.VolumeUSD = vol
+
+        rows.Add tx
+NextR:
+    Next r
+
+    Set LoadTransactions = rows
+End Function
+
+Private Function InferDirection(ByVal entity As String, ByVal seller As String, ByVal purchaser As String) As String
+    Dim e As String: e = LCase$(Trim$(entity))
+    If Len(e) = 0 Then InferDirection = "Other": Exit Function
+
+    If InStr(1, LCase$(seller), e, vbTextCompare) > 0 And InStr(1, LCase$(purchaser), e, vbTextCompare) = 0 Then
+        InferDirection = "Sales"
+    ElseIf InStr(1, LCase$(purchaser), e, vbTextCompare) > 0 And InStr(1, LCase$(seller), e, vbTextCompare) = 0 Then
+        InferDirection = "Purchases"
+    Else
+        InferDirection = "Other"
+    End If
+End Function
+
+' =========================
+' OUTPUT
+' =========================
+Private Function WriteTopTitle(ByVal ws As Worksheet, ByVal outRow As Long, ByVal entityName As String) As Long
+    With ws.Range(ws.Cells(outRow, 1), ws.Cells(outRow, 5))
+        .Merge
+        .Value = entityName
+        .Interior.Color = RGB(0, 0, 0)
+        .Font.Color = vbWhite
+        .Font.Bold = True
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+    End With
+    ws.Rows(outRow).RowHeight = 20
+    WriteTopTitle = outRow
+End Function
+
+Private Function PrintGroupedTransactions(ByVal wsOut As Worksheet, ByVal outRow As Long, _
+                                         ByVal data As Collection, ByVal entityName As String) As Long
+
+    Dim groups As Object
+    Set groups = CreateObject("Scripting.Dictionary")
+    groups.CompareMode = 1 ' TextCompare
+
+    Dim i As Long
+    For i = 1 To data.Count
+        Dim tx As TxRow
+        tx = data(i)
+
+        Dim key As String
+        key = LCase$(Trim$(tx.Category)) & "||" & tx.Direction
+
+        If Not groups.Exists(key) Then
+            groups.Add key, New Collection
+        End If
+        groups(key).Add tx
+    Next i
+
+    Dim keys() As Variant
+    keys = groups.Keys
+    SortVariantArray keys
+
+    Dim k As Long
+    For k = LBound(keys) To UBound(keys)
+        Dim key As String: key = CStr(keys(k))
+        Dim parts() As String: parts = Split(key, "||")
+
+        Dim catLabel As String: catLabel = parts(0)
+        Dim dirLabel As String: dirLabel = parts(1)
+
+        outRow = outRow + 1
+        outRow = WriteSectionHeader(wsOut, outRow, Application.WorksheetFunction.Proper(catLabel))
+        outRow = outRow + 1
+        outRow = WriteSubHeader(wsOut, outRow, dirLabel & " by " & EntityShort(entityName))
+        outRow = outRow + 1
+        outRow = WriteColumnHeaders(wsOut, outRow)
+
+        Dim subtotal As Double: subtotal = 0#
+        Dim rows As Collection: Set rows = groups(key)
+
+        Dim r As Long
+        For r = 1 To rows.Count
+            Dim tx As TxRow: tx = rows(r)
+            outRow = outRow + 1
+            WriteDataRow wsOut, outRow, dirLabel, tx.Counterparty, tx.Jurisdiction, tx.Relationship, tx.VolumeUSD
+            subtotal = subtotal + tx.VolumeUSD
+        Next r
+
+        outRow = outRow + 1
+        WriteTotalRow wsOut, outRow, subtotal
+        outRow = outRow + 1
+    Next k
+
+    PrintGroupedTransactions = outRow
+End Function
+
+Private Function WriteSectionHeader(ByVal ws As Worksheet, ByVal r As Long, ByVal title As String) As Long
+    With ws.Range(ws.Cells(r, 1), ws.Cells(r, 5))
+        .Merge
+        .Value = title
+        .Interior.Color = RGB(0, 0, 0)
+        .Font.Color = vbWhite
+        .Font.Bold = True
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+    End With
+    WriteSectionHeader = r
+End Function
+
+Private Function WriteSubHeader(ByVal ws As Worksheet, ByVal r As Long, ByVal title As String) As Long
+    With ws.Range(ws.Cells(r, 1), ws.Cells(r, 5))
+        .Merge
+        .Value = title
+        .Interior.Color = RGB(217, 217, 217)
+        .Font.Bold = True
+        .HorizontalAlignment = xlLeft
+        .VerticalAlignment = xlCenter
+    End With
+    WriteSubHeader = r
+End Function
+
+Private Function WriteColumnHeaders(ByVal ws As Worksheet, ByVal r As Long) As Long
+    ws.Cells(r, 1).Value = "Covered Transaction"
+    ws.Cells(r, 2).Value = "Counterparty"
+    ws.Cells(r, 3).Value = "Tax Jurisdiction"
+    ws.Cells(r, 4).Value = "Relationship"
+    ws.Cells(r, 5).Value = "Volume (USD)"
+
+    With ws.Range(ws.Cells(r, 1), ws.Cells(r, 5))
+        .Interior.Color = RGB(47, 117, 181)
+        .Font.Color = vbWhite
+        .Font.Bold = True
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+        .Borders.LineStyle = xlContinuous
+    End With
+    WriteColumnHeaders = r
+End Function
+
+Private Sub WriteDataRow(ByVal ws As Worksheet, ByVal r As Long, ByVal coveredTx As String, ByVal counterparty As String, _
+                         ByVal juris As String, ByVal rel As String, ByVal vol As Double)
+
+    ws.Cells(r, 1).Value = coveredTx
+    ws.Cells(r, 2).Value = counterparty
+    ws.Cells(r, 3).Value = juris
+    ws.Cells(r, 4).Value = rel
+    ws.Cells(r, 5).Value = vol
+
+    With ws.Range(ws.Cells(r, 1), ws.Cells(r, 5))
+        .Borders.LineStyle = xlContinuous
+        .VerticalAlignment = xlCenter
+    End With
+
+    ws.Cells(r, 5).NumberFormat = "#,##0"
+    ws.Cells(r, 5).HorizontalAlignment = xlRight
+End Sub
+
+Private Sub WriteTotalRow(ByVal ws As Worksheet, ByVal r As Long, ByVal totalVol As Double)
+    ws.Cells(r, 1).Value = "Total"
+    ws.Range(ws.Cells(r, 1), ws.Cells(r, 4)).Merge
+    ws.Cells(r, 5).Value = totalVol
+    ws.Cells(r, 5).NumberFormat = "#,##0"
+
+    With ws.Range(ws.Cells(r, 1), ws.Cells(r, 5))
+        .Interior.Color = RGB(217, 217, 217)
+        .Font.Bold = True
+        .Borders.LineStyle = xlContinuous
+        .VerticalAlignment = xlCenter
+    End With
+    ws.Cells(r, 5).HorizontalAlignment = xlRight
+End Sub
+
+Private Function EntityShort(ByVal entityName As String) As String
+    Dim s As String: s = Trim$(entityName)
+    If Len(s) <= 12 Then
+        EntityShort = s
+    Else
+        Dim parts() As String: parts = Split(s, " ")
+        If UBound(parts) >= 0 Then EntityShort = parts(0) Else EntityShort = Left$(s, 12)
+    End If
+End Function
+
+' =========================
+' FINDING HELPERS
+' =========================
+Private Function FindWorksheetByNameInsensitive(ByVal wb As Workbook, ByVal exactName As String) As Worksheet
+    Dim ws As Worksheet
+    For Each ws In wb.Worksheets
+        If LCase$(ws.Name) = LCase$(exactName) Then
+            Set FindWorksheetByNameInsensitive = ws
+            Exit Function
+        End If
+    Next ws
+    Set FindWorksheetByNameInsensitive = Nothing
+End Function
+
+Private Function FindWorksheetByNameContainsInsensitive(ByVal wb As Workbook, ByVal needle As String) As Worksheet
+    Dim ws As Worksheet
+    For Each ws In wb.Worksheets
+        If InStr(1, LCase$(ws.Name), LCase$(needle), vbTextCompare) > 0 Then
+            Set FindWorksheetByNameContainsInsensitive = ws
+            Exit Function
+        End If
+    Next ws
+    Set FindWorksheetByNameContainsInsensitive = Nothing
+End Function
+
+Private Function FindHeaderRow(ByVal ws As Worksheet, ByVal mustContain As Variant) As Long
+    Dim ur As Range: Set ur = ws.UsedRange
+    Dim r As Long
+    For r = ur.Row To ur.Row + ur.Rows.Count - 1
+        If RowContainsAny(ws, r, mustContain) Then
+            FindHeaderRow = r
+            Exit Function
+        End If
+    Next r
+    FindHeaderRow = 0
+End Function
+
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerRow As Long, ByVal keys As Variant, Optional ByVal startCol As Long = 1) As Long
+    Dim lastC As Long: lastC = ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
+    Dim c As Long, k As Long
+    For c = startCol To lastC
+        Dim txt As String: txt = LCase$(Trim$(CStr(ws.Cells(headerRow, c).Value2)))
+        If Len(txt) = 0 Then GoTo NextC
+        For k = LBound(keys) To UBound(keys)
+            If InStr(1, txt, LCase$(CStr(keys(k))), vbTextCompare) > 0 Then
+                FindHeaderCol = c
+                Exit Function
+            End If
+        Next k
+NextC:
+    Next c
+    FindHeaderCol = 0
+End Function
+
+Private Function FindLastDataRow(ByVal ws As Worksheet, ByVal keyCol As Long, ByVal startRow As Long) As Long
+    Dim r As Long
+    r = ws.Cells(ws.Rows.Count, keyCol).End(xlUp).Row
+    If r < startRow Then r = startRow
+    FindLastDataRow = r
+End Function
+
+Private Function RowContainsAny(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal needles As Variant) As Boolean
+    Dim lastC As Long
+    lastC = ws.Cells(rowNum, ws.Columns.Count).End(xlToLeft).Column
+    If lastC < 1 Then RowContainsAny = False: Exit Function
+
+    Dim rowText As String: rowText = ""
+    Dim c As Long, v As Variant
+    For c = 1 To lastC
+        v = ws.Cells(rowNum, c).Value2
+        If Not IsError(v) Then
+            If Len(Trim$(CStr(v))) > 0 Then rowText = rowText & " " & LCase$(CStr(v))
+        End If
+    Next c
+
+    Dim i As Long
+    For i = LBound(needles) To UBound(needles)
+        If InStr(rowText, LCase$(CStr(needles(i)))) > 0 Then
+            RowContainsAny = True
+            Exit Function
+        End If
+    Next i
+    RowContainsAny = False
+End Function
+
+' =========================
+' FY + ENTITY HELPERS
+' =========================
+Private Function DetectFYSuffix(ByVal ws As Worksheet) As String
+    Dim ur As Range: Set ur = ws.UsedRange
+    Dim r As Long, c As Long, t As String
+
+    For r = ur.Row To ur.Row + ur.Rows.Count - 1
+        For c = ur.Column To ur.Column + ur.Columns.Count - 1
+            If Not IsError(ws.Cells(r, c).Value2) Then
+                t = UCase$(CStr(ws.Cells(r, c).Value2))
+                Dim yr As Long: yr = ExtractFYYear(t)
+                If yr >= 2000 Then DetectFYSuffix = Right$(CStr(yr), 2): Exit Function
+
+                Dim two As String: two = ExtractFY2Digit(t)
+                If Len(two) = 2 Then DetectFYSuffix = two: Exit Function
+            End If
+        Next c
+    Next r
+
+    DetectFYSuffix = ""
+End Function
+
+Private Function ExtractFYYear(ByVal s As String) As Long
+    Dim i As Long
+    For i = 1 To Len(s) - 3
+        Dim chunk As String: chunk = Mid$(s, i, 4)
+        If chunk Like "20##" Then ExtractFYYear = CLng(chunk): Exit Function
+    Next i
+    ExtractFYYear = 0
+End Function
+
+Private Function ExtractFY2Digit(ByVal s As String) As String
+    Dim i As Long
+    For i = 1 To Len(s) - 3
+        If Mid$(s, i, 2) = "FY" Then
+            Dim two As String: two = Mid$(s, i + 2, 2)
+            If two Like "##" Then ExtractFY2Digit = two: Exit Function
+        End If
+    Next i
+    ExtractFY2Digit = ""
+End Function
+
+Private Function GetEntityNameRow1(ByVal ws As Worksheet) As String
+    Dim c As Long
+    For c = 1 To ws.Columns.Count
+        Dim v As String: v = Trim$(CStr(ws.Cells(1, c).Value2))
+        If Len(v) > 0 Then GetEntityNameRow1 = v: Exit Function
+    Next c
+    GetEntityNameRow1 = ""
+End Function
+
+' =========================
+' UTILITIES
+' =========================
+Private Function OpenWorkbookSafe(ByVal fullPath As String) As Workbook
+    Dim wb As Workbook
+    For Each wb In Application.Workbooks
+        If StrComp(wb.FullName, fullPath, vbTextCompare) = 0 Then
+            Set OpenWorkbookSafe = wb
+            Exit Function
+        End If
+    Next wb
+    Set OpenWorkbookSafe = Application.Workbooks.Open(Filename:=fullPath, ReadOnly:=True)
+End Function
+
+Private Function CleanFileName(ByVal s As String) As String
+    Dim badChars As Variant, i As Long
+    badChars = Array("\", "/", ":", "*", "?", """", "<", ">", "|")
+    For i = LBound(badChars) To UBound(badChars)
+        s = Replace(s, badChars(i), "")
+    Next i
+    CleanFileName = Trim$(s)
+End Function
+
+Private Function GetUniqueSavePath(ByVal folderPath As String, ByVal baseName As String, ByVal ext As String) As String
+    Dim candidate As String
+    candidate = folderPath & "\" & baseName & "." & ext
+    If Dir(candidate) = "" Then GetUniqueSavePath = candidate: Exit Function
+
+    Dim n As Long: n = 1
+    Do
+        candidate = folderPath & "\" & baseName & " (" & n & ")." & ext
+        If Dir(candidate) = "" Then GetUniqueSavePath = candidate: Exit Function
+        n = n + 1
+    Loop
+End Function
+
+Private Function CDblSafe(ByVal v As Variant) As Double
+    If IsNumeric(v) Then CDblSafe = CDbl(v) Else CDblSafe = 0#
+End Function
+
+Private Sub SortVariantArray(ByRef arr As Variant)
+    Dim i As Long, j As Long
+    For i = LBound(arr) To UBound(arr) - 1
+        For j = i + 1 To UBound(arr)
+            If CStr(arr(j)) < CStr(arr(i)) Then
+                Dim tmp As Variant
+                tmp = arr(i): arr(i) = arr(j): arr(j) = tmp
+            End If
+        Next j
+    Next i
+End Sub
