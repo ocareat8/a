@@ -1,0 +1,237 @@
+Option Explicit
+
+' ========= CONFIG =========
+Private Const SRC_SHEET_PRIMARY As String = "Additional entity-specific"
+
+' ========= ENTRY POINT =========
+Public Sub Build_TestedPartyData_FromIR()
+    Dim filePath As String
+    filePath = PickWorkbookFile("Select the client Information Request Excel file")
+    If Len(filePath) = 0 Then Exit Sub ' cancelled
+
+    Dim wbIR As Workbook
+    Set wbIR = OpenWorkbookSafe(filePath)
+
+    Dim srcSheetName As String
+    srcSheetName = FindFirstExistingSheetName(wbIR, Array( _
+        SRC_SHEET_PRIMARY, _
+        "Additional Entity-Specific", _
+        "Additional entity specific", _
+        "Additional Entity Specific" _
+    ))
+
+    If Len(srcSheetName) = 0 Then
+        Err.Raise vbObjectError + 100, , _
+            "Could not find the 'Additional entity-specific' tab in the selected file." & vbCrLf & _
+            "Please confirm the tab name or add its variant to the candidates list."
+    End If
+
+    Dim wsSrc As Worksheet
+    Set wsSrc = wbIR.Worksheets(srcSheetName)
+
+    Dim entityName As String
+    entityName = GetEntityName(wsSrc)
+
+    Dim fyCells As Collection
+    Set fyCells = FindFirstTwoFiscalPeriodCells(wsSrc)
+
+    If fyCells.Count = 0 Then Err.Raise vbObjectError + 101, , "No 'Fiscal periods (FY ####)' header found."
+    If fyCells.Count = 1 Then Err.Raise vbObjectError + 102, , "Only one FY block found (need current + prior)."
+
+    Dim wbOut As Workbook
+    Set wbOut = Workbooks.Add(xlWBATWorksheet)
+
+    ' Remove extra default sheets (leave 1)
+    Application.DisplayAlerts = False
+    Do While wbOut.Worksheets.Count > 1
+        wbOut.Worksheets(wbOut.Worksheets.Count).Delete
+    Loop
+    Application.DisplayAlerts = True
+
+    ' Build current FY sheet on Sheet1
+    BuildOneFYSheet wbOut.Worksheets(1), wsSrc, fyCells(1), entityName
+
+    ' Add second sheet for prior FY
+    wbOut.Worksheets.Add After:=wbOut.Worksheets(1)
+    BuildOneFYSheet wbOut.Worksheets(2), wsSrc, fyCells(2), entityName
+
+    wbOut.Worksheets(1).Activate
+End Sub
+
+' ========= CORE BUILD =========
+Private Sub BuildOneFYSheet(ByVal wsOut As Worksheet, ByVal wsSrc As Worksheet, ByVal fyCell As Range, ByVal entityName As String)
+    Dim fyYear As Long
+    fyYear = ExtractFYYear(CStr(fyCell.Value2))
+    If fyYear = 0 Then fyYear = 9999
+
+    wsOut.Name = "Tested Party Data (FY" & Right$(CStr(fyYear), 2) & ")"
+
+    ' Identify label column and header row
+    Dim headerRow As Long: headerRow = fyCell.Row
+    Dim labelCol As Long: labelCol = fyCell.Column
+
+    ' Detect value columns by header text on that header row
+    Dim colLocal As Long, colUS As Long
+    colLocal = FindHeaderColOnRow(wsSrc, headerRow, Array("local gaap", "local gap", "local"))
+    colUS = FindHeaderColOnRow(wsSrc, headerRow, Array("u.s. gaap", "us gaap", "u.s. gap", "us gap", "u.s.", "us"))
+
+    ' Decide whether to include each based on whether they have any filled values for the 5 lines
+    Dim includeLocal As Boolean, includeUS As Boolean
+    includeLocal = ColumnHasAnyDataForPnL(wsSrc, headerRow, labelCol, colLocal)
+    includeUS = ColumnHasAnyDataForPnL(wsSrc, headerRow, labelCol, colUS)
+
+    ' If both false but one column exists, still include that column (clients may have blanks for one line)
+    If Not includeLocal And colLocal > 0 Then includeLocal = True
+    If Not includeUS And colUS > 0 Then includeUS = True
+
+    Dim lastCol As Long
+    lastCol = 1 + IIf(includeLocal, 1, 0) + IIf(includeUS, 1, 0)
+
+    ' --- Row 1: entity header (green, merged) ---
+    wsOut.Cells(1, 1).Value = entityName
+    With wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(1, lastCol))
+        .Merge
+        .Interior.Color = RGB(0, 176, 80)
+        .Font.Color = vbWhite
+        .Font.Bold = True
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+    End With
+
+    ' --- Row 2: FY header + column headers (yellow) ---
+    wsOut.Cells(2, 1).Value = CStr(fyCell.Value2)
+    wsOut.Cells(2, 1).Font.Bold = True
+
+    Dim outCol As Long: outCol = 2
+    If includeLocal Then
+        wsOut.Cells(2, outCol).Value = "Local GAAP"
+        wsOut.Cells(2, outCol).Font.Bold = True
+        outCol = outCol + 1
+    End If
+    If includeUS Then
+        wsOut.Cells(2, outCol).Value = "US GAAP"
+        wsOut.Cells(2, outCol).Font.Bold = True
+    End If
+
+    With wsOut.Range(wsOut.Cells(2, 1), wsOut.Cells(2, lastCol))
+        .Interior.Color = RGB(255, 255, 0)
+    End With
+
+    ' --- Pull the 5 simplified P&L line items ---
+    Dim items As Variant
+    items = Array( _
+        "Revenue", _
+        "Cost of sales", _
+        "Gross profit", _
+        "Other operating expenses/income", _
+        "Operating profit/(loss)" _
+    )
+
+    Dim rOut As Long: rOut = 3
+    Dim i As Long
+    For i = LBound(items) To UBound(items)
+        Dim srcRow As Long
+        srcRow = FindLineItemRowInBlock(wsSrc, headerRow + 1, labelCol, CStr(items(i)))
+
+        wsOut.Cells(rOut, 1).Value = items(i)
+
+        outCol = 2
+        If includeLocal Then
+            wsOut.Cells(rOut, outCol).Value = IIf(srcRow > 0 And colLocal > 0, wsSrc.Cells(srcRow, colLocal).Value2, vbNullString)
+            outCol = outCol + 1
+        End If
+        If includeUS Then
+            wsOut.Cells(rOut, outCol).Value = IIf(srcRow > 0 And colUS > 0, wsSrc.Cells(srcRow, colUS).Value2, vbNullString)
+        End If
+
+        rOut = rOut + 1
+    Next i
+
+    ' --- Append NCP then Operating Margin ---
+    Dim rowRevenue As Long: rowRevenue = FindExactRow(wsOut, 3, "Revenue")
+    Dim rowCOS As Long: rowCOS = FindExactRow(wsOut, 3, "Cost of sales")
+    Dim rowOpex As Long: rowOpex = FindExactRow(wsOut, 3, "Other operating expenses/income")
+    Dim rowOP As Long: rowOP = FindExactRow(wsOut, 3, "Operating profit/(loss)")
+
+    wsOut.Cells(rOut, 1).Value = "Net Cost Plus (NCP)"
+    wsOut.Cells(rOut + 1, 1).Value = "Operating Margin (OM)"
+    wsOut.Range(wsOut.Cells(rOut, 1), wsOut.Cells(rOut + 1, 1)).Font.Bold = True
+
+    Dim c As Long
+    For c = 2 To lastCol
+        ' NCP = OP / (COS + Opex)
+        If rowOP > 0 And rowCOS > 0 And rowOpex > 0 Then
+            wsOut.Cells(rOut, c).Formula = "=" & wsOut.Cells(rowOP, c).Address(False, False) & "/(" & _
+                                                wsOut.Cells(rowCOS, c).Address(False, False) & "+" & _
+                                                wsOut.Cells(rowOpex, c).Address(False, False) & ")"
+            wsOut.Cells(rOut, c).NumberFormat = "0.00%"
+        End If
+
+        ' OM = OP / Revenue
+        If rowOP > 0 And rowRevenue > 0 Then
+            wsOut.Cells(rOut + 1, c).Formula = "=" & wsOut.Cells(rowOP, c).Address(False, False) & "/" & _
+                                                   wsOut.Cells(rowRevenue, c).Address(False, False)
+            wsOut.Cells(rOut + 1, c).NumberFormat = "0.00%"
+        End If
+    Next c
+
+    ' --- Light formatting ---
+    wsOut.Columns("A:" & ColLetter(lastCol)).AutoFit
+    wsOut.Rows(1).RowHeight = 20
+    wsOut.Rows(2).RowHeight = 18
+End Sub
+
+' ========= PARSING HELPERS =========
+
+Private Function FindFirstTwoFiscalPeriodCells(ByVal ws As Worksheet) As Collection
+    Dim results As New Collection
+    Dim ur As Range: Set ur = ws.UsedRange
+
+    Dim r As Long, c As Long
+    For r = ur.Row To ur.Row + ur.Rows.Count - 1
+
+        ' Stop if we hit segmented P&Ls (so we only get simplified P&L at top)
+        If RowContainsAny(ws, r, Array("distribution activity", "management services activity")) Then Exit For
+
+        For c = ur.Column To ur.Column + ur.Columns.Count - 1
+            Dim v As String: v = Trim$(CStr(ws.Cells(r, c).Value2))
+            If LooksLikeFiscalPeriods(v) Then
+                results.Add ws.Cells(r, c)
+                If results.Count = 2 Then
+                    Set FindFirstTwoFiscalPeriodCells = results
+                    Exit Function
+                End If
+            End If
+        Next c
+    Next r
+
+    Set FindFirstTwoFiscalPeriodCells = results
+End Function
+
+Private Function LooksLikeFiscalPeriods(ByVal s As String) As Boolean
+    Dim t As String: t = LCase$(Trim$(s))
+    LooksLikeFiscalPeriods = (InStr(t, "fiscal") > 0 And InStr(t, "period") > 0 And InStr(t, "(fy") > 0 And InStr(t, ")") > 0)
+End Function
+
+Private Function ExtractFYYear(ByVal s As String) As Long
+    Dim i As Long
+    For i = 1 To Len(s) - 3
+        Dim chunk As String
+        chunk = Mid$(s, i, 4)
+        If chunk Like "20##" Then
+            ExtractFYYear = CLng(chunk)
+            Exit Function
+        End If
+    Next i
+    ExtractFYYear = 0
+End Function
+
+Private Function FindHeaderColOnRow(ByVal ws As Worksheet, ByVal headerRow As Long, ByVal keys As Variant) As Long
+    Dim lastC As Long: lastC = ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
+    Dim c As Long, k As Long
+
+    For c = 1 To lastC
+        Dim cellText As String: cellText = LCase$(Trim$(CStr(ws.Cells(headerRow, c).Value2)))
+        If Len(cellText) = 0 Then GoTo NextC
+
+        For k = LBoun
