@@ -1,0 +1,101 @@
+Option Explicit
+
+Private Const SRC_SHEET_PRIMARY As String = "Additional entity-specific"
+
+Public Sub Build_TestedPartyData_FromIR()
+    Dim filePath As String
+    filePath = PickWorkbookFile("Select the client Information Request Excel file")
+
+    If Len(filePath) = 0 Then Exit Sub ' user cancelled
+
+    Dim wbIR As Workbook
+    Set wbIR = OpenWorkbookSafe(filePath)
+
+    Dim srcSheetName As String
+    srcSheetName = FindFirstExistingSheetName(wbIR, Array( _
+        SRC_SHEET_PRIMARY, _
+        "Additional Entity-Specific", _
+        "Additional entity specific", _
+        "Additional Entity Specific" _
+    ))
+
+    If Len(srcSheetName) = 0 Then
+        Err.Raise vbObjectError + 100, , _
+            "Could not find the 'Additional entity-specific' tab in the selected file." & vbCrLf & _
+            "Please confirm the tab name or add its variant to the candidates list."
+    End If
+
+    Dim ws As Worksheet
+    Set ws = wbIR.Worksheets(srcSheetName)
+
+    Dim entityName As String
+    entityName = GetEntityName(ws)
+
+    Dim fyCells As Collection
+    Set fyCells = FindFirstTwoFiscalPeriodCells(ws)
+
+    If fyCells.Count = 0 Then Err.Raise vbObjectError + 1, , "No 'Fiscal periods (FY ####)' header found."
+    If fyCells.Count = 1 Then Err.Raise vbObjectError + 2, , "Only one FY block found (need current + prior)."
+
+    Dim wbOut As Workbook
+    Set wbOut = Workbooks.Add(xlWBATWorksheet)
+
+    ' clean default extra sheets
+    Application.DisplayAlerts = False
+    Do While wbOut.Worksheets.Count > 1
+        wbOut.Worksheets(wbOut.Worksheets.Count).Delete
+    Loop
+    Application.DisplayAlerts = True
+
+    ' build sheets
+    BuildOneFYSheet wbOut.Worksheets(1), ws, fyCells(1), entityName
+    wbOut.Worksheets.Add After:=wbOut.Worksheets(1)
+    BuildOneFYSheet wbOut.Worksheets(2), ws, fyCells(2), entityName
+
+    wbOut.Worksheets(1).Activate
+End Sub
+
+' ---------- File picking + open helpers ----------
+
+Private Function PickWorkbookFile(ByVal dialogTitle As String) As String
+    Dim fp As Variant
+    fp = Application.GetOpenFilename( _
+        FileFilter:="Excel Files (*.xlsx;*.xlsm;*.xls), *.xlsx;*.xlsm;*.xls", _
+        Title:=dialogTitle _
+    )
+    If fp = False Then
+        PickWorkbookFile = vbNullString
+    Else
+        PickWorkbookFile = CStr(fp)
+    End If
+End Function
+
+Private Function OpenWorkbookSafe(ByVal fullPath As String) As Workbook
+    ' If already open, reuse; else open read-only
+    Dim wb As Workbook
+    For Each wb In Application.Workbooks
+        If StrComp(wb.FullName, fullPath, vbTextCompare) = 0 Then
+            Set OpenWorkbookSafe = wb
+            Exit Function
+        End If
+    Next wb
+
+    Set OpenWorkbookSafe = Application.Workbooks.Open(Filename:=fullPath, ReadOnly:=True)
+End Function
+
+Private Function FindFirstExistingSheetName(ByVal wb As Workbook, ByVal candidates As Variant) As String
+    Dim i As Long
+    For i = LBound(candidates) To UBound(candidates)
+        If SheetExists(wb, CStr(candidates(i))) Then
+            FindFirstExistingSheetName = CStr(candidates(i))
+            Exit Function
+        End If
+    Next i
+    FindFirstExistingSheetName = vbNullString
+End Function
+
+Private Function SheetExists(ByVal wb As Workbook, ByVal sheetName As String) As Boolean
+    On Error Resume Next
+    SheetExists = Not wb.Worksheets(sheetName) Is Nothing
+    On Error GoTo 0
+End Function
