@@ -1,0 +1,499 @@
+Option Explicit
+
+' ========= CONFIG =========
+Private Const SRC_SHEET_PRIMARY As String = "Additional entity-specific"
+
+' ========= ENTRY POINT =========
+Public Sub Build_TestedPartyData_FromIR()
+
+    Dim filePath As String
+    filePath = PickWorkbookFile("Select the client Information Request Excel file")
+    If Len(filePath) = 0 Then Exit Sub
+
+    Dim wbIR As Workbook
+    Set wbIR = OpenWorkbookSafe(filePath)
+
+    Dim srcSheetName As String
+    srcSheetName = FindFirstExistingSheetName(wbIR, Array( _
+        SRC_SHEET_PRIMARY, _
+        "Additional Entity-Specific", _
+        "Additional entity specific", _
+        "Additional Entity Specific" _
+    ))
+
+    If Len(srcSheetName) = 0 Then
+        Err.Raise vbObjectError + 100, , "Could not find the 'Additional entity-specific' tab in the selected file."
+    End If
+
+    Dim wsSrc As Worksheet
+    Set wsSrc = wbIR.Worksheets(srcSheetName)
+
+    Dim entityName As String
+    entityName = GetEntityName(wsSrc)
+
+    Dim fyCells As Collection
+    Set fyCells = FindFirstTwoFiscalPeriodCells(wsSrc)
+
+    If fyCells.Count = 0 Then Err.Raise vbObjectError + 101, , "No 'Fiscal periods (FY ####)' header found."
+    If fyCells.Count = 1 Then Err.Raise vbObjectError + 102, , "Only one FY block found (need current + prior)."
+
+    Dim wbOut As Workbook
+    Set wbOut = Workbooks.Add(xlWBATWorksheet)
+
+    ' Remove extra default sheets (leave 1)
+    Application.DisplayAlerts = False
+    Do While wbOut.Worksheets.Count > 1
+        wbOut.Worksheets(wbOut.Worksheets.Count).Delete
+    Loop
+    Application.DisplayAlerts = True
+
+    ' Build current FY sheet on Sheet1
+    BuildOneFYSheet wbOut.Worksheets(1), wsSrc, fyCells(1), entityName
+
+    ' Add second sheet for prior FY
+    wbOut.Worksheets.Add After:=wbOut.Worksheets(1)
+    BuildOneFYSheet wbOut.Worksheets(2), wsSrc, fyCells(2), entityName
+
+    ' Remove gridlines (window-level)
+    wbOut.Worksheets(1).Activate
+    wbOut.Windows(1).DisplayGridlines = False
+
+    ' ===== TRUE workbook rename = SaveAs =====
+    Dim fyYear As Long: fyYear = ExtractFYYear(CStr(fyCells(1).Value2))
+    Dim fySuffix As String: fySuffix = Right$(CStr(fyYear), 2) ' 2025 -> "25"
+
+    Dim safeEntity As String: safeEntity = CleanFileName(entityName)
+    Dim baseName As String: baseName = safeEntity & "_FY" & fySuffix & "_Tested Party Data"
+
+    Dim outFolder As String
+    outFolder = wbIR.Path
+    If Len(outFolder) = 0 Then outFolder = Environ$("USERPROFILE") & "\Desktop"
+
+    Dim fullSavePath As String
+    fullSavePath = GetUniqueSavePath(outFolder, baseName, "xlsx")
+
+    Application.DisplayAlerts = False
+    wbOut.SaveAs Filename:=fullSavePath, FileFormat:=xlOpenXMLWorkbook
+    Application.DisplayAlerts = True
+
+End Sub
+
+' ========= CORE BUILD =========
+Private Sub BuildOneFYSheet(ByVal wsOut As Worksheet, ByVal wsSrc As Worksheet, ByVal fyCell As Range, ByVal entityName As String)
+
+    Dim fyYear As Long
+    fyYear = ExtractFYYear(CStr(fyCell.Value2))
+    If fyYear = 0 Then fyYear = 9999
+
+    wsOut.Name = "Tested Party Data (FY" & Right$(CStr(fyYear), 2) & ")"
+
+    ' Default font: Calibri 10
+    With wsOut.Cells
+        .Font.Name = "Calibri"
+        .Font.Size = 10
+    End With
+
+    Dim headerRow As Long: headerRow = fyCell.Row
+    Dim labelCol As Long: labelCol = fyCell.Column
+
+    ' Detect value columns by header text
+    Dim colLocal As Long, colUS As Long
+    colLocal = FindHeaderColOnRow(wsSrc, headerRow, Array("local gaap", "local gap", "local"))
+    colUS = FindHeaderColOnRow(wsSrc, headerRow, Array("u.s. gaap", "us gaap", "u.s. gap", "us gap", "u.s.", "us"))
+
+    ' Include ONLY if there is actual data for simplified P&L lines
+    Dim includeLocal As Boolean, includeUS As Boolean
+    includeLocal = ColumnHasAnyDataForPnL(wsSrc, headerRow, labelCol, colLocal)
+    includeUS = ColumnHasAnyDataForPnL(wsSrc, headerRow, labelCol, colUS)
+
+    Dim lastCol As Long
+    lastCol = 1 + IIf(includeLocal, 1, 0) + IIf(includeUS, 1, 0)
+
+    If lastCol = 1 Then
+        Err.Raise vbObjectError + 200, , "No Local/US GAAP data found for simplified P&L in FY " & fyYear & "."
+    End If
+
+    ' --- Row 1: entity header (merged, green, wrap so not cut off) ---
+    wsOut.Cells(1, 1).Value = entityName
+    With wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(1, lastCol))
+        .Merge
+        .Interior.Color = RGB(112, 173, 71)
+        .Font.Color = vbBlack
+        .Font.Bold = True
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+        .WrapText = True
+    End With
+    wsOut.Rows(1).RowHeight = 30
+
+    ' --- Row 2: FY header + column headers (yellow) ---
+    wsOut.Cells(2, 1).Value = CStr(fyCell.Value2)
+    wsOut.Cells(2, 1).Font.Bold = True
+
+    Dim outCol As Long: outCol = 2
+    If includeLocal Then
+        wsOut.Cells(2, outCol).Value = "Local GAAP"
+        wsOut.Cells(2, outCol).Font.Bold = True
+        outCol = outCol + 1
+    End If
+    If includeUS Then
+        wsOut.Cells(2, outCol).Value = "US GAAP"
+        wsOut.Cells(2, outCol).Font.Bold = True
+    End If
+
+    wsOut.Range(wsOut.Cells(2, 1), wsOut.Cells(2, lastCol)).Interior.Color = RGB(255, 255, 0)
+
+    ' numeric headers: right + middle
+    If lastCol >= 2 Then
+        With wsOut.Range(wsOut.Cells(2, 2), wsOut.Cells(2, lastCol))
+            .HorizontalAlignment = xlRight
+            .VerticalAlignment = xlCenter
+        End With
+    End If
+
+    ' --- Pull the 5 simplified P&L line items ---
+    Dim items As Variant
+    items = Array( _
+        "Revenue", _
+        "Cost of sales", _
+        "Gross profit", _
+        "Other operating expenses/income", _
+        "Operating profit/(loss)" _
+    )
+
+    Dim rOut As Long: rOut = 3
+    Dim i As Long
+    For i = LBound(items) To UBound(items)
+        Dim srcRow As Long
+        srcRow = FindLineItemRowInBlock(wsSrc, headerRow + 1, labelCol, CStr(items(i)))
+
+        wsOut.Cells(rOut, 1).Value = items(i)
+
+        outCol = 2
+        If includeLocal Then
+            wsOut.Cells(rOut, outCol).Value = IIf(srcRow > 0 And colLocal > 0, wsSrc.Cells(srcRow, colLocal).Value2, vbNullString)
+            outCol = outCol + 1
+        End If
+        If includeUS Then
+            wsOut.Cells(rOut, outCol).Value = IIf(srcRow > 0 And colUS > 0, wsSrc.Cells(srcRow, colUS).Value2, vbNullString)
+        End If
+
+        rOut = rOut + 1
+    Next i
+
+    ' numeric columns: right + middle, #,##0
+    If lastCol >= 2 Then
+        With wsOut.Range(wsOut.Cells(3, 2), wsOut.Cells(rOut - 1, lastCol))
+            .HorizontalAlignment = xlRight
+            .VerticalAlignment = xlCenter
+            .NumberFormat = "#,##0"
+        End With
+    End If
+
+    ' --- Append NCP then Operating Margin ---
+    Dim rowRevenue As Long: rowRevenue = FindExactRow(wsOut, 3, "Revenue")
+    Dim rowCOS As Long: rowCOS = FindExactRow(wsOut, 3, "Cost of sales")
+    Dim rowOpex As Long: rowOpex = FindExactRow(wsOut, 3, "Other operating expenses/income")
+    Dim rowOP As Long: rowOP = FindExactRow(wsOut, 3, "Operating profit/(loss)")
+
+    wsOut.Cells(rOut, 1).Value = "Net Cost Plus (NCP)"
+    wsOut.Cells(rOut + 1, 1).Value = "Operating Margin (OM)"
+    wsOut.Range(wsOut.Cells(rOut, 1), wsOut.Cells(rOut + 1, 1)).Font.Bold = True
+
+    ' Shade NCP/OM rows
+    wsOut.Range(wsOut.Cells(rOut, 1), wsOut.Cells(rOut + 1, lastCol)).Interior.Color = RGB(191, 191, 191)
+
+    Dim c As Long
+    For c = 2 To lastCol
+        wsOut.Cells(rOut, c).Formula = "=" & wsOut.Cells(rowOP, c).Address(False, False) & "/(" & _
+                                            wsOut.Cells(rowCOS, c).Address(False, False) & "+" & _
+                                            wsOut.Cells(rowOpex, c).Address(False, False) & ")"
+        wsOut.Cells(rOut, c).NumberFormat = "0.00%"
+        wsOut.Cells(rOut, c).Font.Bold = True
+        wsOut.Cells(rOut, c).HorizontalAlignment = xlRight
+        wsOut.Cells(rOut, c).VerticalAlignment = xlCenter
+
+        wsOut.Cells(rOut + 1, c).Formula = "=" & wsOut.Cells(rowOP, c).Address(False, False) & "/" & _
+                                               wsOut.Cells(rowRevenue, c).Address(False, False)
+        wsOut.Cells(rOut + 1, c).NumberFormat = "0.00%"
+        wsOut.Cells(rOut + 1, c).Font.Bold = True
+        wsOut.Cells(rOut + 1, c).HorizontalAlignment = xlRight
+        wsOut.Cells(rOut + 1, c).VerticalAlignment = xlCenter
+    Next c
+
+    ' --- Borders: all borders around the full output table area ---
+    Dim lastRow As Long: lastRow = rOut + 1
+    With wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(lastRow, lastCol))
+        .Borders(xlEdgeLeft).LineStyle = xlContinuous
+        .Borders(xlEdgeTop).LineStyle = xlContinuous
+        .Borders(xlEdgeBottom).LineStyle = xlContinuous
+        .Borders(xlEdgeRight).LineStyle = xlContinuous
+        .Borders(xlInsideVertical).LineStyle = xlContinuous
+        .Borders(xlInsideHorizontal).LineStyle = xlContinuous
+    End With
+
+    wsOut.Columns(1).HorizontalAlignment = xlLeft
+    wsOut.Columns(1).VerticalAlignment = xlCenter
+
+    wsOut.Columns("A:" & ColLetter(lastCol)).AutoFit
+End Sub
+
+' ========= PARSING HELPERS =========
+
+Private Function FindFirstTwoFiscalPeriodCells(ByVal ws As Worksheet) As Collection
+    Dim results As New Collection
+    Dim ur As Range: Set ur = ws.UsedRange
+
+    Dim r As Long, c As Long
+    For r = ur.Row To ur.Row + ur.Rows.Count - 1
+
+        ' Stop scanning once we hit segmented sections (varies by template)
+        If RowContainsAny(ws, r, Array( _
+            "segmented results", _
+            "manufacturing:", _
+            "distribution:", _
+            "engineering services:", _
+            "management services", _
+            "activity:" _
+        )) Then Exit For
+
+        For c = ur.Column To ur.Column + ur.Columns.Count - 1
+            Dim v As String: v = Trim$(CStr(ws.Cells(r, c).Value2))
+            If LooksLikeFiscalPeriods(v) Then
+                results.Add ws.Cells(r, c)
+                If results.Count = 2 Then
+                    Set FindFirstTwoFiscalPeriodCells = results
+                    Exit Function
+                End If
+            End If
+        Next c
+    Next r
+
+    Set FindFirstTwoFiscalPeriodCells = results
+End Function
+
+Private Function LooksLikeFiscalPeriods(ByVal s As String) As Boolean
+    Dim t As String: t = LCase$(Trim$(s))
+    LooksLikeFiscalPeriods = (InStr(t, "fiscal") > 0 And InStr(t, "period") > 0 And InStr(t, "(fy") > 0 And InStr(t, ")") > 0)
+End Function
+
+Private Function ExtractFYYear(ByVal s As String) As Long
+    Dim i As Long
+    For i = 1 To Len(s) - 3
+        Dim chunk As String
+        chunk = Mid$(s, i, 4)
+        If chunk Like "20##" Then
+            ExtractFYYear = CLng(chunk)
+            Exit Function
+        End If
+    Next i
+    ExtractFYYear = 0
+End Function
+
+Private Function FindHeaderColOnRow(ByVal ws As Worksheet, ByVal headerRow As Long, ByVal keys As Variant) As Long
+    Dim lastC As Long: lastC = ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
+    Dim c As Long, k As Long
+
+    For c = 1 To lastC
+        Dim cellText As String: cellText = LCase$(Trim$(CStr(ws.Cells(headerRow, c).Value2)))
+        If Len(cellText) = 0 Then GoTo NextC
+
+        For k = LBound(keys) To UBound(keys)
+            If InStr(cellText, LCase$(CStr(keys(k)))) > 0 Then
+                FindHeaderColOnRow = c
+                Exit Function
+            End If
+        Next k
+NextC:
+    Next c
+
+    FindHeaderColOnRow = 0
+End Function
+
+Private Function ColumnHasAnyDataForPnL(ByVal ws As Worksheet, ByVal headerRow As Long, ByVal labelCol As Long, ByVal colValue As Long) As Boolean
+    If colValue = 0 Then ColumnHasAnyDataForPnL = False: Exit Function
+
+    Dim labels As Variant
+    labels = Array("Revenue", "Cost of sales", "Gross profit", "Other operating expenses/income", "Operating profit/(loss)")
+
+    Dim i As Long
+    For i = LBound(labels) To UBound(labels)
+        Dim r As Long
+        r = FindLineItemRowInBlock(ws, headerRow + 1, labelCol, CStr(labels(i)))
+        If r > 0 Then
+            If Not IsError(ws.Cells(r, colValue).Value2) Then
+                If Len(Trim$(CStr(ws.Cells(r, colValue).Value2))) > 0 Then
+                    ColumnHasAnyDataForPnL = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i
+
+    ColumnHasAnyDataForPnL = False
+End Function
+
+Private Function FindLineItemRowInBlock(ByVal ws As Worksheet, ByVal startRow As Long, ByVal labelCol As Long, ByVal label As String) As Long
+    Dim maxLook As Long: maxLook = startRow + 25
+    Dim r As Long
+
+    For r = startRow To maxLook
+        Dim v As String: v = Trim$(CStr(ws.Cells(r, labelCol).Value2))
+        If Len(v) = 0 Then GoTo NextR
+
+        If NormalizeLabel(v) = NormalizeLabel(label) Then
+            FindLineItemRowInBlock = r
+            Exit Function
+        End If
+NextR:
+    Next r
+
+    FindLineItemRowInBlock = 0
+End Function
+
+Private Function NormalizeLabel(ByVal s As String) As String
+    s = LCase$(Trim$(s))
+    s = Replace(s, " ", "")
+    s = Replace(s, ChrW(160), "")
+    s = Replace(s, "/", "")
+    s = Replace(s, "(", "")
+    s = Replace(s, ")", "")
+    s = Replace(s, "-", "")
+    NormalizeLabel = s
+End Function
+
+' ===== FIXED: robust RowContainsAny (NO Transpose/Join) =====
+Private Function RowContainsAny(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal needles As Variant) As Boolean
+    Dim lastC As Long
+    lastC = ws.Cells(rowNum, ws.Columns.Count).End(xlToLeft).Column
+    If lastC < 1 Then RowContainsAny = False: Exit Function
+
+    Dim rowText As String
+    rowText = BuildRowTextSafe(ws, rowNum, lastC)
+
+    Dim i As Long
+    For i = LBound(needles) To UBound(needles)
+        If InStr(rowText, LCase$(CStr(needles(i)))) > 0 Then
+            RowContainsAny = True
+            Exit Function
+        End If
+    Next i
+
+    RowContainsAny = False
+End Function
+
+Private Function BuildRowTextSafe(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal lastC As Long) As String
+    Dim c As Long, v As Variant, s As String
+    For c = 1 To lastC
+        v = ws.Cells(rowNum, c).Value2
+        If Not IsError(v) Then
+            If Len(Trim$(CStr(v))) > 0 Then
+                s = s & " " & LCase$(CStr(v))
+            End If
+        End If
+    Next c
+    BuildRowTextSafe = s
+End Function
+
+' ========= OUTPUT HELPERS =========
+Private Function FindExactRow(ByVal ws As Worksheet, ByVal startRow As Long, ByVal label As String) As Long
+    Dim lastR As Long: lastR = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    Dim r As Long
+    For r = startRow To lastR
+        If LCase$(Trim$(CStr(ws.Cells(r, 1).Value2))) = LCase$(label) Then
+            FindExactRow = r
+            Exit Function
+        End If
+    Next r
+    FindExactRow = 0
+End Function
+
+Private Function ColLetter(ByVal colNum As Long) As String
+    ColLetter = Split(Cells(1, colNum).Address(True, False), "$")(0)
+End Function
+
+' ========= ENTITY NAME =========
+Private Function GetEntityName(ByVal ws As Worksheet) As String
+    Dim c As Long
+    For c = 1 To ws.Columns.Count
+        Dim v As String
+        v = Trim$(CStr(ws.Cells(1, c).Value2))
+        If Len(v) > 0 Then
+            GetEntityName = v
+            Exit Function
+        End If
+    Next c
+    GetEntityName = "(Entity Name Not Found)"
+End Function
+
+' ========= WORKBOOK NAME / PATH HELPERS =========
+Private Function CleanFileName(ByVal s As String) As String
+    Dim badChars As Variant, i As Long
+    badChars = Array("\", "/", ":", "*", "?", """", "<", ">", "|")
+    For i = LBound(badChars) To UBound(badChars)
+        s = Replace(s, badChars(i), "")
+    Next i
+    CleanFileName = Trim$(s)
+End Function
+
+Private Function GetUniqueSavePath(ByVal folderPath As String, ByVal baseName As String, ByVal ext As String) As String
+    Dim candidate As String
+    candidate = folderPath & "\" & baseName & "." & ext
+    If Dir(candidate) = "" Then
+        GetUniqueSavePath = candidate
+        Exit Function
+    End If
+
+    Dim n As Long: n = 1
+    Do
+        candidate = folderPath & "\" & baseName & " (" & n & ")." & ext
+        If Dir(candidate) = "" Then
+            GetUniqueSavePath = candidate
+            Exit Function
+        End If
+        n = n + 1
+    Loop
+End Function
+
+' ========= FILE PICKING / OPEN =========
+Private Function PickWorkbookFile(ByVal dialogTitle As String) As String
+    Dim fp As Variant
+    fp = Application.GetOpenFilename( _
+        FileFilter:="Excel Files (*.xlsx;*.xlsm;*.xls), *.xlsx;*.xlsm;*.xls", _
+        Title:=dialogTitle _
+    )
+    If fp = False Then
+        PickWorkbookFile = vbNullString
+    Else
+        PickWorkbookFile = CStr(fp)
+    End If
+End Function
+
+Private Function OpenWorkbookSafe(ByVal fullPath As String) As Workbook
+    Dim wb As Workbook
+    For Each wb In Application.Workbooks
+        If StrComp(wb.FullName, fullPath, vbTextCompare) = 0 Then
+            Set OpenWorkbookSafe = wb
+            Exit Function
+        End If
+    Next wb
+    Set OpenWorkbookSafe = Application.Workbooks.Open(Filename:=fullPath, ReadOnly:=True)
+End Function
+
+' ========= SHEET NAME RESOLUTION =========
+Private Function FindFirstExistingSheetName(ByVal wb As Workbook, ByVal candidates As Variant) As String
+    Dim i As Long
+    For i = LBound(candidates) To UBound(candidates)
+        If SheetExists(wb, CStr(candidates(i))) Then
+            FindFirstExistingSheetName = CStr(candidates(i))
+            Exit Function
+        End If
+    Next i
+    FindFirstExistingSheetName = vbNullString
+End Function
+
+Private Function SheetExists(ByVal wb As Workbook, ByVal sheetName As String) As Boolean
+    On Error Resume Next
+    SheetExists = Not wb.Worksheets(sheetName) Is Nothing
+    On Error GoTo 0
+End Function
