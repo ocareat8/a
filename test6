@@ -1,0 +1,237 @@
+Option Explicit
+
+' ========= CONFIG =========
+Private Const SRC_SHEET_PRIMARY As String = "Additional entity-specific"
+
+' ========= ENTRY POINT =========
+Public Sub Build_TestedPartyData_FromIR()
+
+    Dim filePath As String
+    filePath = PickWorkbookFile("Select the client Information Request Excel file")
+    If Len(filePath) = 0 Then Exit Sub
+
+    Dim wbIR As Workbook
+    Set wbIR = OpenWorkbookSafe(filePath)
+
+    Dim srcSheetName As String
+    srcSheetName = FindFirstExistingSheetName(wbIR, Array( _
+        SRC_SHEET_PRIMARY, _
+        "Additional Entity-Specific", _
+        "Additional entity specific", _
+        "Additional Entity Specific" _
+    ))
+
+    If srcSheetName = "" Then
+        Err.Raise vbObjectError + 100, , "Additional entity-specific tab not found."
+    End If
+
+    Dim wsSrc As Worksheet
+    Set wsSrc = wbIR.Worksheets(srcSheetName)
+
+    Dim entityName As String
+    entityName = GetEntityName(wsSrc)
+
+    Dim fyCells As Collection
+    Set fyCells = FindFirstTwoFiscalPeriodCells(wsSrc)
+
+    If fyCells.Count < 2 Then
+        Err.Raise vbObjectError + 101, , "Could not find both current and prior FY blocks."
+    End If
+
+    Dim wbOut As Workbook
+    Set wbOut = Workbooks.Add(xlWBATWorksheet)
+
+    Application.DisplayAlerts = False
+    Do While wbOut.Worksheets.Count > 1
+        wbOut.Worksheets(wbOut.Worksheets.Count).Delete
+    Loop
+    Application.DisplayAlerts = True
+
+    ' Build sheets
+    BuildOneFYSheet wbOut.Worksheets(1), wsSrc, fyCells(1), entityName
+    wbOut.Worksheets.Add After:=wbOut.Worksheets(1)
+    BuildOneFYSheet wbOut.Worksheets(2), wsSrc, fyCells(2), entityName
+
+    ' Remove gridlines
+    wbOut.Worksheets(1).Activate
+    wbOut.Windows(1).DisplayGridlines = False
+
+    ' ===== Name the workbook dynamically =====
+    Dim fyYear As Long
+    fyYear = ExtractFYYear(CStr(fyCells(1).Value2))
+
+    Dim fySuffix As String
+    fySuffix = Right(CStr(fyYear), 2)   ' 2025 -> 25
+
+    Dim safeEntity As String
+    safeEntity = CleanFileName(entityName)
+
+    wbOut.Title = safeEntity & "_FY" & fySuffix & "_Tested Party Data"
+
+End Sub
+
+' ========= CORE BUILD =========
+Private Sub BuildOneFYSheet(wsOut As Worksheet, wsSrc As Worksheet, fyCell As Range, entityName As String)
+
+    Dim fyYear As Long
+    fyYear = ExtractFYYear(CStr(fyCell.Value2))
+
+    wsOut.Name = "Tested Party Data (FY" & Right(CStr(fyYear), 2) & ")"
+
+    wsOut.Cells.Font.Name = "Calibri"
+    wsOut.Cells.Font.Size = 10
+
+    Dim headerRow As Long: headerRow = fyCell.Row
+    Dim labelCol As Long: labelCol = fyCell.Column
+
+    Dim colLocal As Long, colUS As Long
+    colLocal = FindHeaderColOnRow(wsSrc, headerRow, Array("local"))
+    colUS = FindHeaderColOnRow(wsSrc, headerRow, Array("us"))
+
+    Dim includeLocal As Boolean, includeUS As Boolean
+    includeLocal = ColumnHasAnyDataForPnL(wsSrc, headerRow, labelCol, colLocal)
+    includeUS = ColumnHasAnyDataForPnL(wsSrc, headerRow, labelCol, colUS)
+
+    Dim lastCol As Long
+    lastCol = 1 + IIf(includeLocal, 1, 0) + IIf(includeUS, 1, 0)
+
+    ' --- Entity header ---
+    wsOut.Cells(1, 1).Value = entityName
+    With wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(1, lastCol))
+        .Merge
+        .Interior.Color = RGB(112, 173, 71)
+        .Font.Bold = True
+        .Font.Color = vbBlack
+        .HorizontalAlignment = xlCenter
+        .VerticalAlignment = xlCenter
+        .WrapText = True
+    End With
+    wsOut.Rows(1).RowHeight = 30
+
+    ' --- FY header ---
+    wsOut.Cells(2, 1).Value = fyCell.Value2
+    wsOut.Cells(2, 1).Font.Bold = True
+
+    Dim cOut As Long: cOut = 2
+    If includeLocal Then
+        wsOut.Cells(2, cOut).Value = "Local GAAP"
+        wsOut.Cells(2, cOut).Font.Bold = True
+        cOut = cOut + 1
+    End If
+    If includeUS Then
+        wsOut.Cells(2, cOut).Value = "US GAAP"
+        wsOut.Cells(2, cOut).Font.Bold = True
+    End If
+
+    wsOut.Range(wsOut.Cells(2, 1), wsOut.Cells(2, lastCol)).Interior.Color = RGB(255, 255, 0)
+
+    ' --- P&L Lines ---
+    Dim labels As Variant
+    labels = Array("Revenue", "Cost of sales", "Gross profit", _
+                   "Other operating expenses/income", "Operating profit/(loss)")
+
+    Dim r As Long: r = 3
+    Dim i As Long
+    For i = LBound(labels) To UBound(labels)
+        wsOut.Cells(r, 1).Value = labels(i)
+
+        cOut = 2
+        Dim srcRow As Long
+        srcRow = FindLineItemRowInBlock(wsSrc, headerRow + 1, labelCol, labels(i))
+
+        If includeLocal Then
+            wsOut.Cells(r, cOut).Value = IIf(srcRow > 0, wsSrc.Cells(srcRow, colLocal).Value, "")
+            cOut = cOut + 1
+        End If
+        If includeUS Then
+            wsOut.Cells(r, cOut).Value = IIf(srcRow > 0, wsSrc.Cells(srcRow, colUS).Value, "")
+        End If
+        r = r + 1
+    Next i
+
+    ' --- Numeric formatting ---
+    If lastCol >= 2 Then
+        With wsOut.Range(wsOut.Cells(3, 2), wsOut.Cells(r - 1, lastCol))
+            .HorizontalAlignment = xlRight
+            .VerticalAlignment = xlCenter
+            .NumberFormat = "#,##0"
+        End With
+    End If
+
+    ' --- NCP + OM ---
+    Dim rowRev As Long: rowRev = FindExactRow(wsOut, 3, "Revenue")
+    Dim rowCOS As Long: rowCOS = FindExactRow(wsOut, 3, "Cost of sales")
+    Dim rowOpex As Long: rowOpex = FindExactRow(wsOut, 3, "Other operating expenses/income")
+    Dim rowOP As Long: rowOP = FindExactRow(wsOut, 3, "Operating profit/(loss)")
+
+    wsOut.Cells(r, 1).Value = "Net Cost Plus (NCP)"
+    wsOut.Cells(r + 1, 1).Value = "Operating Margin (OM)"
+    wsOut.Range(wsOut.Cells(r, 1), wsOut.Cells(r + 1, lastCol)).Interior.Color = RGB(191, 191, 191)
+
+    Dim c As Long
+    For c = 2 To lastCol
+        wsOut.Cells(r, c).Formula = "=" & wsOut.Cells(rowOP, c).Address(False, False) & _
+                                   "/(" & wsOut.Cells(rowCOS, c).Address(False, False) & _
+                                   "+" & wsOut.Cells(rowOpex, c).Address(False, False) & ")"
+        wsOut.Cells(r + 1, c).Formula = "=" & wsOut.Cells(rowOP, c).Address(False, False) & _
+                                       "/" & wsOut.Cells(rowRev, c).Address(False, False)
+        wsOut.Range(wsOut.Cells(r, c), wsOut.Cells(r + 1, c)).Font.Bold = True
+        wsOut.Range(wsOut.Cells(r, c), wsOut.Cells(r + 1, c)).NumberFormat = "0.00%"
+    Next c
+
+    ' --- Borders ---
+    With wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(r + 1, lastCol))
+        .Borders.LineStyle = xlContinuous
+    End With
+
+    wsOut.Columns.AutoFit
+
+End Sub
+
+' ========= HELPERS =========
+Private Function CleanFileName(s As String) As String
+    Dim bad As Variant, i As Long
+    bad = Array("\", "/", ":", "*", "?", """", "<", ">", "|")
+    For i = LBound(bad) To UBound(bad)
+        s = Replace(s, bad(i), "")
+    Next i
+    CleanFileName = Trim(s)
+End Function
+
+Private Function ExtractFYYear(s As String) As Long
+    Dim i As Long
+    For i = 1 To Len(s) - 3
+        If Mid(s, i, 4) Like "20##" Then
+            ExtractFYYear = CLng(Mid(s, i, 4))
+            Exit Function
+        End If
+    Next i
+End Function
+
+Private Function GetEntityName(ws As Worksheet) As String
+    Dim c As Long
+    For c = 1 To ws.Columns.Count
+        If Trim(ws.Cells(1, c).Value) <> "" Then
+            GetEntityName = ws.Cells(1, c).Value
+            Exit Function
+        End If
+    Next c
+End Function
+
+Private Function PickWorkbookFile(title As String) As String
+    Dim f As Variant
+    f = Application.GetOpenFilename("Excel Files (*.xlsx;*.xlsm;*.xls),*.xlsx;*.xlsm;*.xls", , title)
+    If f = False Then PickWorkbookFile = "" Else PickWorkbookFile = f
+End Function
+
+Private Function OpenWorkbookSafe(path As String) As Workbook
+    Dim wb As Workbook
+    For Each wb In Workbooks
+        If wb.FullName = path Then Set OpenWorkbookSafe = wb: Exit Function
+    Next wb
+    Set OpenWorkbookSafe = Workbooks.Open(path, ReadOnly:=True)
+End Function
+
+' (Other helper functions like FindFirstTwoFiscalPeriodCells,
+'  FindHeaderColOnRow, NormalizeLabel, etc. are unchanged and assumed present
+'  from your prior working version.)
